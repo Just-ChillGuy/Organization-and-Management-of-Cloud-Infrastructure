@@ -51,3 +51,148 @@
 Не взят `10.0.0.0/16`: это значение по умолчанию во многих шаблонах и частая причина конфликтов при соединении сетей.
 
 ---
+
+## 2. Таблица подсетей
+
+Логика нумерации третьего октета: `1–3` — публичные, `11–13` — приватные, `21–23` — data.
+
+| Зона | Подсеть | CIDR | Тип | Маршрут по умолчанию |
+|---|---|---|---|---|
+| AZ1 | публичная | 10.10.1.0/24 | public | IGW |
+| AZ1 | приватная | 10.10.11.0/24 | private | NAT GW a |
+| AZ1 | data | 10.10.21.0/24 | data | NAT GW a + S3 Endpoint |
+| AZ2 | публичная | 10.10.2.0/24 | public | IGW |
+| AZ2 | приватная | 10.10.12.0/24 | private | NAT GW b |
+| AZ2 | data | 10.10.22.0/24 | data | NAT GW b + S3 Endpoint |
+| AZ3 | публичная | 10.10.3.0/24 | public | IGW |
+| AZ3 | приватная | 10.10.13.0/24 | private | NAT GW c |
+| AZ3 | data | 10.10.23.0/24 | data | NAT GW c + S3 Endpoint |
+
+### Таблицы маршрутизации
+
+**rt-public** — общая для трёх публичных подсетей:
+
+| Назначение | Цель |
+|---|---|
+| 10.10.0.0/16 | local |
+| 0.0.0.0/0 | IGW |
+
+**rt-private-a / b / c** — своя для каждой AZ:
+
+| Назначение | Цель |
+|---|---|
+| 10.10.0.0/16 | local |
+| 172.16.0.0/16 | VGW (on-prem датацентр) |
+| 0.0.0.0/0 | NAT GW своей AZ |
+
+**rt-data-a / b / c** — своя для каждой AZ:
+
+| Назначение | Цель |
+|---|---|
+| 10.10.0.0/16 | local |
+| S3 (prefix list) | S3 Gateway Endpoint |
+| 0.0.0.0/0 | NAT GW своей AZ |
+
+**Почему для data-подсетей NAT + Endpoint.** Серверам БД нужен исходящий интернет для обновлений ОС и PostgreSQL — его даёт NAT Gateway. Бэкапы БД идут в S3 через Gateway Endpoint: он бесплатный, трафик не выходит в интернет и не оплачивается как трафик через NAT.
+
+---
+
+## 3. Схема сети
+
+```mermaid
+flowchart TB
+    users([Покупатели])
+    cdn[CDN<br/>кэш статики]
+    igw[Internet Gateway]
+    onprem[On-premise ДЦ<br/>172.16.0.0/16]
+    s3[(S3 Endpoint<br/>бэкапы БД)]
+    vgw[Virtual Private Gateway]
+    flow[VPC Flow Logs<br/>ALL → CloudWatch]
+
+    users -->|HTTPS 443| cdn
+    cdn -->|cache miss, /api/*, /orders/*| igw
+    flow -.->|логи всего VPC| alb
+
+    subgraph VPC["VPC shopeasy · 10.10.0.0/16"]
+        alb{{"ALB · L7<br/>/api/* и /orders/* → API · остальное → Frontend"}}
+
+        subgraph AZ1["AZ1"]
+            subgraph pub_a["Public 10.10.1.0/24 · 0.0.0.0/0 → IGW"]
+                nat_a[NAT GW a]
+            end
+            subgraph pri_a["Private 10.10.11.0/24 · 0.0.0.0/0 → NAT a"]
+                fe_a[Frontend :80]
+                api_a[API :8080]
+            end
+            subgraph dat_a["Data 10.10.21.0/24 · 0.0.0.0/0 → NAT a"]
+                db_a[(PostgreSQL primary<br/>чтение / запись)]
+            end
+        end
+
+        subgraph AZ2["AZ2"]
+            subgraph pub_b["Public 10.10.2.0/24 · 0.0.0.0/0 → IGW"]
+                nat_b[NAT GW b]
+            end
+            subgraph pri_b["Private 10.10.12.0/24 · 0.0.0.0/0 → NAT b"]
+                fe_b[Frontend :80]
+                api_b[API :8080]
+            end
+            subgraph dat_b["Data 10.10.22.0/24 · 0.0.0.0/0 → NAT b"]
+                db_b[(PostgreSQL standby<br/>sync-репликация)]
+            end
+        end
+
+        subgraph AZ3["AZ3"]
+            subgraph pub_c["Public 10.10.3.0/24 · 0.0.0.0/0 → IGW"]
+                nat_c[NAT GW c]
+            end
+            subgraph pri_c["Private 10.10.13.0/24 · 0.0.0.0/0 → NAT c"]
+                fe_c[Frontend :80]
+                api_c[API :8080]
+            end
+            subgraph dat_c["Data 10.10.23.0/24 · 0.0.0.0/0 → NAT c"]
+                db_c[(PostgreSQL replica<br/>async, только чтение)]
+            end
+        end
+    end
+
+    igw --> alb
+    alb --> fe_a & api_a
+    alb --> fe_b & api_b
+    alb --> fe_c & api_c
+
+    api_a -->|5432| db_a
+    api_b -->|5432| db_b
+    api_c -->|5432| db_c
+
+    api_a -.->|egress| nat_a
+    api_b -.->|egress| nat_b
+    api_c -.->|egress| nat_c
+
+    db_a -.->|бэкапы| s3
+
+    vgw ---|Direct Connect — основной| onprem
+    vgw -.-|Site-to-Site VPN — резервный| onprem
+
+    classDef pub fill:#EEF6E2,stroke:#6A9A1F
+    classDef pri fill:#E4F0FA,stroke:#1F6FB2
+    classDef dat fill:#F4E8F8,stroke:#8E3AA8
+    classDef ext fill:#FFF6E5,stroke:#C77700
+    class nat_a,nat_b,nat_c pub
+    class fe_a,api_a,fe_b,api_b,fe_c,api_c pri
+    class db_a,db_b,db_c dat
+    class users,cdn,igw,onprem,s3,vgw,flow ext
+```
+
+На схеме показаны:
+
+- VPC с тремя AZ, в каждой — public, private и data-подсеть;
+- CDN перед входом, Internet Gateway и ALB с узлами во всех публичных подсетях;
+- NAT Gateway в каждой AZ;
+- фронтенд и API в приватных подсетях;
+- PostgreSQL в data-подсетях: primary, standby и read-replica;
+- S3 Endpoint и VPC Flow Logs;
+- связь с датацентром: Direct Connect (основной канал) и Site-to-Site VPN (резервный).
+
+---
+
